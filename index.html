@@ -189,8 +189,10 @@ for(const k in F){ val[k]=F[k].def; }
 
 let sceneIdx = 0, autoOn = false, RES_SCALE = 0.6;
 
+const FRESH = location.search.indexOf('d') >= 0;   /* ?d arranca con valores por defecto */
+if(FRESH){ try{ localStorage.removeItem('visapp.v3'); }catch(e){} }
 try{
-  const s = JSON.parse(localStorage.getItem('visapp.v3') || '{}');
+  const s = FRESH ? {} : JSON.parse(localStorage.getItem('visapp.v3') || '{}');
   for(const k in (s.val||{})) if(k in val) val[k] = s.val[k];
   for(const k in P) base[k] = val[k];
   if(typeof s.scene === 'number' && s.scene < SCENES.length) sceneIdx = s.scene;
@@ -275,59 +277,69 @@ vec3 camS(vec2 q){
   return texture(uCam, clamp(uv, 0.0, 1.0)).rgb;
 }
 
-/* ============ CHURN ============ */
-vec4 simChurn(vec2 uv, vec2 uvc){
+/* ============ FLUX ============
+   Advección por campo de flujo (curl de fbm) + inyección de pigmento por
+   máscara de ruido. Guarda color en RGB y un campo de altura en A, que la
+   pasada de salida usa para el relieve y los contornos.
+   Todo el mezclado es interpolación, no suma → no puede irse a blanco.
+============================================================== */
+vec4 simFlux(vec2 uv, vec2 uvc){
   float t  = uTime;
-  float bs = 0.22 + uDetail*1.45;
+  vec2  px = 1.0/uRes;
+  float sc = 0.8 + uDetail*3.4;
 
-  vec2 dir = normalize(vec2(sin(uColor*TAU + t*0.13), cos(uColor*TAU + t*0.11)) + 1e-5);
-  float drive = 0.35 + uBass*2.6 + uHit*2.2 + uHigh*0.9;
-  vec2 tAll = (0.08 + uPush*2.4)*dir*drive;
+  /* campo de flujo: pseudo-curl de dos fbm desfasados */
+  float n1 = fbm3(uvc*sc + vec2(0.0, t*0.13));
+  float n2 = fbm3(uvc*sc + vec2(t*0.11, 0.0) + 27.3);
+  vec2 curl = vec2(n2 - 0.5, 0.5 - n1)*2.0;
 
-  if(uSwirl > 0.02){ dir = normalize(uvc + 1e-5); tAll = uSwirl*30.0*dir*(0.5 + uLevel*1.6); }
-  if(uLift  > 0.02){ dir = vec2(-1.0, 0.0);       tAll = uLift*13.0*dir; }
-  tAll += normalize(uvc + 1e-5)*uHit*14.0*uPush;      /* patada radial en el golpe */
+  vec4 pv = texture(uPrev, uv);
 
-  vec2 t0 = rot( t)*tAll, t1 = rot(-t)*tAll;
-  vec2 t2 = rot(PI*0.5)*tAll, t3 = rot(-PI*0.5)*tAll, t4 = -tAll;
+  vec2 adv = curl*(0.35 + uPush*2.2);
+  adv += vec2(sin(uColor*PI + t*0.10), cos(uColor*PI + t*0.08))*0.30;
+  if(uSwirl > 0.02) adv += vec2(-uvc.y, uvc.x)/(length(uvc) + 0.28)*uSwirl*2.4;
+  if(uLift  > 0.02) adv += vec2(-1.0, 0.0)*uLift*3.2;
+  adv += normalize(uvc + 1e-5)*uHit*2.2*uPush;
+  adv += (pv.rg - pv.gb)*(0.8 + uHigh*2.2);          /* el color se auto-advecta */
 
-  vec2 wp = 4.0/uRes;
-  float wg = -5.0;
+  float sp = 1.2 + uPush*3.2 + uBass*2.4 + uHit*3.4;
+  vec2 suv = uv - adv*px*sp*2.2;
 
-  vec4 c = -1.0 + 2.0*texture(uPrev, uv);
-  c = -1.0 + 2.0*texture(uPrev, uv + t0*wp*c.rg);
-  c = -1.0 + 2.0*texture(uPrev, uv - t1*wp*c.ba);
-  c = -1.0 + 2.0*texture(uPrev, uv + t2*wp*c.ar);
-  c = -1.0 + 2.0*texture(uPrev, uv - t3*wp*c.gb);
+  vec4 sv  = texture(uPrev, suv);
+  vec3 col = sv.rgb;
 
-  vec2 d = 3.0/uRes;
-  vec4 lp = -1.0 + 2.0*0.25*(
-      texture(uPrev, uv+vec2(d.x,0.0)) + texture(uPrev, uv-vec2(d.x,0.0))
-    + texture(uPrev, uv+vec2(0.0,d.y)) + texture(uPrev, uv-vec2(0.0,d.y)));
+  /* difusión ligera: quita el ruido de un pixel y suaviza los bordes duros */
+  vec3 blr = ( texture(uPrev, suv + vec2(px.x, 0.0)).rgb
+             + texture(uPrev, suv - vec2(px.x, 0.0)).rgb
+             + texture(uPrev, suv + vec2(0.0, px.y)).rgb
+             + texture(uPrev, suv - vec2(0.0, px.y)).rgb )*0.25;
+  col = mix(col, blr, 0.10);
 
-  vec4 phi = vec4(uHit*3.0 + uBeat*1.5);
-  vec4 g = vec4(
-    dot(fract(uv - c.rg*bs), vec2( 1.0,  1.0)),
-    dot(fract(uv + c.ba*bs), vec2(-2.0,  0.0)),
-    dot(fract(uv + c.gr*bs), vec2( 0.0,  2.0)),
-    dot(fract(uv + c.ab*bs), vec2( 1.0, -1.0)));
-  g = sin(TAU*g + wg*c.gbar + phi);
-  g = sig4(2.0*g - g.gbar);
-  g *= vec4(1.0, 0.57, 0.27, 0.77)*(1.0 + uHigh*2.2);
+  /* inyección de pigmento: poca base, refuerzo donde el ruido es alto */
+  float ink  = fbm3(uvc*sc*1.7 - curl*0.6 + t*0.07);
+  float mask = smoothstep(0.34, 0.66, ink);
+  /* rango de tono amplio → hues distintos en vez de un promedio café */
+  vec3  pig  = pal(uColor + ink*1.1 + sv.a*0.5);
+  pig = mix(vec3(dot(pig, vec3(0.333))), pig, 0.85);
+  float amt = 0.006 + 0.055*mask + uBass*0.055 + uHit*0.09;
+  col = mix(col, pig, amt);
 
-  vec4 cn = 0.5*c + g + 0.25*sig4(c - lp);
-  cn = cn.gbar;
+  /* decaimiento: el lienzo cae a negro, nunca acumula hacia blanco */
+  col *= 0.986 + uFeed*0.012;
+  col -= 0.0008;
 
-  vec4 cd = cn - c;
-  cd = 0.04*mix(cd, cd.gbra - cd.brga, 0.3*length(t4) + 0.4);
-  cd += (0.045 + uHigh*0.09)*normalize(cn - dot(cn, vec4(0.25)) + 1e-5);
+  /* campo de altura para el relieve (la parte de Mais Garde) */
+  float hn = fbm3(uvc*sc*2.4 + curl*(0.4 + uPush*1.6) + t*0.09);
+  hn = mix(hn, dot(col, vec3(0.333))*1.2, 0.40);
+  float h = mix(hn, sv.a, clamp(uFeed*0.86, 0.0, 0.94));
 
-  float presence = clamp(uHigh - uBass, -1.0, 1.0);
-  float rate = mix(1.8, 0.35, uFeed)*(1.0 + uHit*1.5);
-  cn = 0.5 + 0.5*clamp(c + cd*rate*(presence + 0.45), -1.0, 1.0);
+  if(uCamMix > 0.001){
+    vec3 cam = camS(uvc);
+    col = mix(col, cam, uCamMix*0.10);
+    h   = mix(h, dot(cam, vec3(0.333)), uCamMix*0.45);
+  }
 
-  if(uCamMix > 0.001) cn = mix(cn, vec4(camS(uvc), 1.0), uCamMix*0.24);
-  return cn;
+  return vec4(clamp(col, 0.0, 1.0), h);
 }
 
 /* ============ RELIEF ============ */
@@ -473,11 +485,11 @@ void main(){
   uvc.x *= uRes.x/uRes.y;
 
   if(uFrame < 3.0){
-    fragColor = vec4(fbm3(uvc*5.0), fbm3(uvc*5.0 + 3.1), fbm3(uvc*5.0 + 7.7), 1.0);
+    fragColor = vec4(fbm3(uvc*5.0), fbm3(uvc*5.0 + 3.1), fbm3(uvc*5.0 + 7.7), fbm3(uvc*4.0 + 11.0));
     return;
   }
 
-  if      (uScene == 0) fragColor = simChurn(uv, uvc);
+  if      (uScene == 0) fragColor = simFlux(uv, uvc);
   else if (uScene == 1) fragColor = simRelief(uv, uvc);
   else if (uScene == 2) fragColor = simMirror(uv, uvc);
   else                  fragColor = simChrome(uv, uvc);
@@ -495,14 +507,45 @@ void main(){
   vec3 c;
 
   if(uScene == 0){
-    vec4 s = texture(uTex, uv)*2.0 - 1.0;
-    c = 0.5 + 0.5*sig3(2.0*(s.rgb - 0.25*s.bar));
-    c = c + 0.05 + 0.15*normalize(c - dot(c, vec3(0.3333)) + 1e-5);
-    vec3 h = rgb2hsv(clamp(c, 0.0, 1.0));
-    h.x = fract(h.x + uColor + uTog*0.12);
-    h.y = clamp(h.y*(1.25 + uHigh*0.8), 0.0, 1.0);
-    h.z = clamp(h.z*(1.0 + uHit*0.5), 0.0, 1.0);
-    c = hsv2rgb(h);
+    /* FLUX — pintura advectada + relieve y contornos desde el canal de altura */
+    vec2 e = 1.0/uRes;
+    vec4  s     = texture(uTex, uv);
+    vec3  paint = s.rgb;
+    float hC    = s.a;
+
+    float rel = 30.0 + uDetail*70.0;
+    float hx = texture(uTex, uv + vec2(e.x,0.0)).a - texture(uTex, uv - vec2(e.x,0.0)).a;
+    float hy = texture(uTex, uv + vec2(0.0,e.y)).a - texture(uTex, uv - vec2(0.0,e.y)).a;
+    vec3 n = normalize(vec3(-hx*rel, -hy*rel, 1.0));
+
+    vec3 L = normalize(vec3(cos(uTime*0.25)*0.6, sin(uTime*0.21)*0.6, 0.80));
+    /* iluminación multiplicativa con piso: modela sin blanquear */
+    float diff = 0.54 + 0.58*clamp(dot(n, L), 0.0, 1.0);
+    float spec = pow(clamp(dot(reflect(-L, n), vec3(0.0,0.0,1.0)), 0.0, 1.0), 30.0 + uDetail*40.0);
+
+    c = paint*diff;
+
+    /* contornos que oscurecen y tiñen, en vez de encender */
+    float bands = 4.0 + uDetail*18.0;
+    float f = fract(hC*bands);
+    float m = min(f, 1.0 - f);
+    float line = 1.0 - smoothstep(0.0, 0.035 + uHigh*0.04, m);
+    c = mix(c, pal(uColor + 0.45)*0.62, line*0.68);
+
+    c += spec*0.50*(0.6 + uHigh*0.5);
+
+    /* techo de saturación */
+    vec3 hv = rgb2hsv(clamp(c, 0.0, 4.0));
+    hv.y = min(hv.y*0.95, 0.82);
+    c = hsv2rgb(hv);
+
+    /* curva S: recupera contraste sin subir saturación */
+    c = mix(c, c*c*(3.0 - 2.0*clamp(c, 0.0, 1.0)), 0.45);
+
+    /* compresión suave de luces: mantiene el tono, mata el blanco quemado */
+    float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    float kn = 0.78;
+    if(lum > kn) c *= (kn + (lum - kn)/(1.0 + (lum - kn)*2.6))/max(lum, 1e-4);
 
   } else if(uScene == 1){
     vec2 e = 1.0/uRes;
@@ -555,7 +598,8 @@ void main(){
   c.r = mix(c.r, texture(uTex, uv + d).r, 0.35);
   c.b = mix(c.b, texture(uTex, uv - d).b, 0.35);
   float vig = 1.0 - 0.32*pow(length(uv - 0.5)*1.35, 2.0);
-  fragColor = vec4(clamp(c*vig*(1.0 + uHit*0.22), 0.0, 1.0), 1.0);
+  float kick = (uScene == 0) ? 1.0 + uHit*0.07 : 1.0 + uHit*0.22;
+  fragColor = vec4(clamp(c*vig*kick, 0.0, 1.0), 1.0);
 }`;
 
 function compile(type, src){
