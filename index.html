@@ -126,7 +126,6 @@
   <div class="brand"><span id="beatdot"></span><b>VJPXLZD</b> <span class="fps" id="fps">--</span></div>
   <button class="btn" id="bCam">CAM OFF</button>
   <button class="btn" id="bMic">MIC</button>
-  <button class="btn" id="bVhs">VHS</button>
   <button class="btn" id="bHide">UI</button>
 </div>
 
@@ -170,7 +169,7 @@ let toastT;
 function toast(m){ const t=$('#toast'); t.textContent=m; t.style.opacity='1'; clearTimeout(toastT); toastT=setTimeout(()=>t.style.opacity='0',1500); }
 
 /* -------------------------------------------------- 1 · PARÁMETROS */
-const SCENES = ['MELT','OIL','MIRROR','CHROME','FLOW'];
+const SCENES = ['MELT','OIL','MIRROR','CHROME','FLOW','CRT'];
 
 /* rnd = ventana que usa el botón RND. Más angosta que el rango total para que
    no caiga en extremos que apagan el visual (FEED en 0, DETAIL en 0, etc.) */
@@ -191,8 +190,7 @@ const val = {}, base = {};
 for(const k in P){ val[k]=P[k].def; base[k]=P[k].def; }
 for(const k in F){ val[k]=F[k].def; }
 
-let sceneIdx = 0, autoOn = false, RES_SCALE = 0.6, vhsMode = 0;   /* 0 off, 1 soft, 2 heavy */
-const VHS_AMT = [0.0, 0.45, 1.0];
+let sceneIdx = 0, autoOn = false, RES_SCALE = 0.6;
 
 const FRESH = location.search.indexOf('d') >= 0;   /* ?d arranca con valores por defecto */
 if(FRESH){ try{ localStorage.removeItem('visapp.v3'); }catch(e){} }
@@ -202,13 +200,10 @@ try{
   for(const k in P) base[k] = val[k];
   if(typeof s.scene === 'number' && s.scene < SCENES.length) sceneIdx = s.scene;
   if(typeof s.res === 'number') RES_SCALE = s.res;
-  if(typeof s.vhs === 'number') vhsMode = s.vhs;
 }catch(e){}
 { const h = parseInt(location.hash.replace('#',''), 10);
-  if(!isNaN(h) && h >= 0 && h < SCENES.length) sceneIdx = h;
-  const mv = location.search.match(/vhs=([0-2])/);
-  if(mv) vhsMode = parseInt(mv[1], 10); }
-function save(){ try{ localStorage.setItem('visapp.v3', JSON.stringify({val, scene:sceneIdx, res:RES_SCALE, vhs:vhsMode})); }catch(e){} }
+  if(!isNaN(h) && h >= 0 && h < SCENES.length) sceneIdx = h; }
+function save(){ try{ localStorage.setItem('visapp.v3', JSON.stringify({val, scene:sceneIdx, res:RES_SCALE})); }catch(e){} }
 
 /* -------------------------------------------------- 2 · SHADERS */
 const VS = `#version 300 es
@@ -233,7 +228,7 @@ uniform float uPush, uSwirl, uDetail, uColor, uFeed;
 uniform float uBass, uMid, uHigh, uLevel, uHit, uBeat, uTog, uRnd;
 uniform float uLift, uMotion, uBright;
 uniform float uCamMix, uCamAspect, uMirrorX;
-uniform float uFrame, uSteps, uVhs;
+uniform float uFrame, uSteps;
 
 mat2 rot(float a){ float c=cos(a), s=sin(a); return mat2(c,-s,s,c); }
 vec4 sig4(vec4 x){ return x/(1.0+abs(x)); }
@@ -505,6 +500,49 @@ vec4 simFlow(vec2 uv, vec2 uvc){
   return vec4(clamp(col, 0.0, 1.0), mv);
 }
 
+/* ============ CRT — señal analógica reventada ============
+   Ecos de signo alternante a la derecha de cada borde (sobreoscilación del
+   amplificador), separación de croma y escalonado. La retícula de fósforos
+   va en la pasada de salida porque es del monitor, no de la señal.
+============================================================== */
+vec3 crtSrc(vec2 q){
+  if(uCamMix > 0.001) return camS(q);
+  /* sin cámara: bandas duras, porque el ringing necesita bordes para sonar */
+  float n = fbm2(q*2.4 + uTime*0.14);
+  n = floor(n*7.0)/7.0;
+  return pal(uColor + n*1.2)*(0.25 + 0.95*n);
+}
+vec4 simCrt(vec2 uv, vec2 uvc){
+  vec2 px = 1.0/uRes;
+
+  /* ringing: 6 ecos con pesos que alternan de signo y decaen */
+  float amp = 0.004 + uPush*0.055 + uHit*0.02;
+  vec3 acc = vec3(0.0);
+  float wsum = 0.0;
+  for(int i = 0; i < 6; i++){
+    float fi = float(i);
+    float w = cos(fi*2.1 + uSwirl*3.0)/(1.0 + fi*0.8);
+    acc  += crtSrc(uvc - vec2(amp*fi, 0.0))*w;
+    wsum += abs(w);
+  }
+  vec3 ring = acc/max(wsum, 1e-4);
+
+  /* separación de croma: cada canal llega con distinto retardo */
+  float ca = amp*(1.3 + uHigh*2.2);
+  vec3 col = vec3(crtSrc(uvc - vec2(ca, 0.0)).r, ring.g, crtSrc(uvc + vec2(ca, 0.0)).b);
+  col = mix(ring, col, 0.75)*1.25;
+
+  /* escalonado de niveles: la señal se cuantiza */
+  float lv = 3.0 + floor(uDetail*13.0);
+  col = floor(clamp(col, 0.0, 1.4)*lv + 0.5)/lv;
+
+  /* persistencia del fósforo, con un poco de arrastre vertical */
+  vec3 prev = texture(uPrev, uv + vec2(0.0, px.y*0.6)).rgb;
+  col = max(col, prev*(uFeed*0.90));
+
+  return vec4(clamp(col, 0.0, 1.0), 1.0);
+}
+
 void main(){
   vec2 uv = vUv;
   vec2 uvc = uv*2.0 - 1.0;
@@ -515,7 +553,8 @@ void main(){
     return;
   }
 
-  if      (uScene == 4) fragColor = simFlow(uv, uvc);
+  if      (uScene == 5) fragColor = simCrt(uv, uvc);
+  else if (uScene == 4) fragColor = simFlow(uv, uvc);
   else if (uScene == 0) fragColor = simMelt(uv, uvc);
   else if (uScene == 1) fragColor = simRelief(uv, uvc);
   else if (uScene == 2) fragColor = simMirror(uv, uvc);
@@ -608,27 +647,30 @@ void main(){
   vec2 uv = vUv;
   vec3 c;
 
-  /* ---- VHS: desplazamiento de coordenadas (va antes de muestrear) ---- */
-  float vhsSw = 0.0;
-  if(uVhs > 0.001){
-    float tv = uTime;
+  if(uScene == 5){
+    /* CRT — retícula de fósforos, líneas de barrido y moiré */
+    c = texture(uTex, uv).rgb;
 
-    /* jitter de base de tiempo: cada línea corrida al azar */
-    float ln = floor(uv.y*uRes.y);
-    float jit = hash21(vec2(ln, floor(tv*30.0))) - 0.5;
-    uv.x += jit*(0.0016 + uVhs*0.0040)*(0.4 + uHit*1.6);
+    float cx = mod(floor(uv.x*uRes.x*0.5), 3.0);
+    vec3 mask = vec3(cx < 0.5 ? 1.0 : 0.30,
+                     (cx > 0.5 && cx < 1.5) ? 1.0 : 0.30,
+                     cx > 1.5 ? 1.0 : 0.30);
+    c *= mix(vec3(1.0), mask, 0.75 + uDetail*0.20)*1.55;
 
-    /* error de tracking: bandas que derivan hacia arriba */
-    float band = fract(uv.y*2.2 + tv*0.06);
-    float bmask = smoothstep(0.95, 1.0, band)*uVhs;
-    uv.x += bmask*(0.018 + uHit*0.055)*(hash21(vec2(floor(tv*8.0), 3.0)) - 0.5)*2.0;
+    /* línea de barrido */
+    c *= 0.72 + 0.28*(0.5 + 0.5*cos(uv.y*uRes.y*PI));
 
-    /* banda de conmutación de cabezas, abajo del cuadro */
-    vhsSw = smoothstep(0.045, 0.0, uv.y)*uVhs;
-    uv.x += vhsSw*(0.04 + 0.09*hash21(vec2(floor(tv*24.0), 7.0)));
-  }
+    /* moiré: interferencia diagonal de la retícula con la imagen */
+    c *= 1.0 + sin((uv.x*uRes.x*0.83 + uv.y*uRes.y*0.51)*PI)*0.09;
 
-  if(uScene == 4){
+    vec3 hv = rgb2hsv(clamp(c, 0.0, 2.0));
+    hv.y = clamp(hv.y*1.45, 0.0, 0.97);
+    c = hsv2rgb(hv);
+
+    float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    if(lum > 0.88) c *= (0.88 + (lum - 0.88)/(1.0 + (lum - 0.88)*3.0))/max(lum, 1e-4);
+
+  } else if(uScene == 4){
     /* FLOW — acumulación, desenfoque direccional, refracción y brillo por velocidad */
     vec2 px = 1.0/uRes;
     vec2 v  = texture(uVel, uv).rg;
@@ -732,41 +774,7 @@ void main(){
   c.b = mix(c.b, texture(uTex, uv - d).b, 0.35);
   float vig = 1.0 - 0.32*pow(length(uv - 0.5)*1.35, 2.0);
   float kick = (uScene == 0) ? 1.0 + uHit*0.04 : 1.0 + uHit*0.09;
-  c = c*vig*kick;
-
-  /* ---- VHS: artefactos de color y cinta ---- */
-  if(uVhs > 0.001){
-    vec2 pxv = 1.0/uRes;
-    float ly = dot(c, vec3(0.299, 0.587, 0.114));
-
-    /* sangrado de croma: el NTSC llevaba el color a poco ancho de banda,
-       así que se escurre hacia la derecha y llega tarde a los bordes */
-    vec3 s1 = texture(uTex, uv - vec2(pxv.x*4.0, 0.0)).rgb;
-    vec3 s2 = texture(uTex, uv - vec2(pxv.x*9.0, 0.0)).rgb;
-    vec3 sm = (s1 + s2)*0.5;
-    vec3 chroma = sm - dot(sm, vec3(0.299, 0.587, 0.114));
-    c = mix(c, clamp(ly + chroma*1.15, 0.0, 1.5), 0.30 + uVhs*0.35);
-
-    /* la banda de conmutación además se ensucia */
-    float nsw = hash21(uv*uRes*0.7 + floor(uTime*30.0));
-    c = mix(c, vec3(nsw*0.8), vhsSw*0.55);
-
-    /* dropouts: guiones cortos donde la cinta perdió contacto */
-    float dl = floor(uv.y*uRes.y*0.5);
-    if(hash21(vec2(dl, floor(uTime*12.0))) > 0.9975 - uVhs*0.0040){
-      float dx = fract(hash21(vec2(dl, 11.0)) + uTime*0.7);
-      if(abs(uv.x - dx) < 0.02 + 0.05*hash21(vec2(dl, 5.0))) c = mix(c, vec3(0.85), 0.70);
-    }
-
-    /* ruido de luma, más presente en las sombras */
-    float ng = hash21(uv*uRes + floor(uTime*30.0));
-    c += (ng - 0.5)*(0.030 + uVhs*0.045)*(1.2 - ly);
-
-    /* líneas de barrido */
-    c *= 1.0 - 0.09*uVhs*(0.5 + 0.5*sin(uv.y*uRes.y*PI));
-  }
-
-  fragColor = vec4(clamp(c, 0.0, 1.0), 1.0);
+  fragColor = vec4(clamp(c*vig*kick, 0.0, 1.0), 1.0);
 }`;
 
 function compile(type, src){
@@ -1138,14 +1146,6 @@ $('#bRes').onclick = () => {
   resize(true); save();
 };
 $('#bRes').textContent = Math.round(RES_SCALE*100) + '%';
-function paintVhs(){
-  const b = $('#bVhs');
-  b.textContent = vhsMode === 0 ? 'VHS' : (vhsMode === 1 ? 'VHS 1' : 'VHS 2');
-  b.className = 'btn' + (vhsMode === 1 ? ' on' : vhsMode === 2 ? ' on2' : '');
-}
-$('#bVhs').onclick = () => { vhsMode = (vhsMode + 1) % 3; paintVhs(); save(); };
-paintVhs();
-
 $('#bHide').onclick  = () => document.body.classList.add('hideui');
 $('#showui').onclick = () => document.body.classList.remove('hideui');
 
@@ -1253,7 +1253,6 @@ function frame(ms){
     set1f(p,'uMirrorX', facing === 'user' ? 1 : 0);
     set1f(p,'uFrame', frameCount);
     set1f(p,'uSteps', steps);
-    set1f(p,'uVhs', VHS_AMT[vhsMode]);
   }
 
   const read = ping, write = 1 - ping;
