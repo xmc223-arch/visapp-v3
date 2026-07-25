@@ -411,11 +411,6 @@ vec3 nrmChrome(vec3 p){
     mapChrome(p+e.yyx) - mapChrome(p-e.yyx)));
 }
 vec3 envChrome(vec3 rd){
-  if(uCamMix > 0.001){
-    vec2 e = vec2(atan(rd.z, rd.x)/TAU + 0.5, acos(clamp(rd.y, -1.0, 1.0))/PI);
-    e.x = mix(e.x, 1.0 - e.x, uMirrorX);
-    return texture(uCam, e).rgb*(1.3 + uHigh*0.5);
-  }
   /* estudio: piso oscuro, cielo claro, softboxes y barras de color */
   vec3 sky = mix(vec3(0.015, 0.015, 0.025), vec3(0.95), smoothstep(-0.20, 0.60, rd.y));
   sky *= mix(pal(uColor + 0.55), vec3(1.0), 0.40);
@@ -423,7 +418,12 @@ vec3 envChrome(vec3 rd){
   sky += sb*(1.9 + uHit*0.8);
   float st = smoothstep(0.35, 0.65, fract(atan(rd.z, rd.x)/TAU*6.0 + uTime*0.03 + uBeat*0.03));
   sky += st*pal(uColor + 0.28)*(0.40 + uHigh*0.6);
-  return sky;
+  if(uCamMix < 0.001) return sky;
+
+  /* la cámara se funde sobre el estudio según el fader */
+  vec2 e = vec2(atan(rd.z, rd.x)/TAU + 0.5, acos(clamp(rd.y, -1.0, 1.0))/PI);
+  e.x = mix(e.x, 1.0 - e.x, uMirrorX);
+  return mix(sky, texture(uCam, e).rgb*(1.3 + uHigh*0.5), uCamMix);
 }
 vec4 simChrome(vec2 uv, vec2 uvc){
   vec3 ro = vec3(0.0, 0.0, -3.1 + uBass*0.18);
@@ -481,17 +481,23 @@ vec4 simFlow(vec2 uv, vec2 uvc){
             + texture(uPrev, suv + vec2(0.0, px.y)).rgb + texture(uPrev, suv - vec2(0.0, px.y)).rgb )*0.25;
   col = mix(col, bl, 0.10 + (1.0 - uDetail)*0.26);
 
-  /* inyección de pigmento */
+  /* inyección de pigmento: fundido continuo entre procedural y cámara */
+  float n = fbm3(uvc*(1.0 + uDetail*3.0) + uTime*0.10);
+  vec3  inkP = pal(uColor + n*0.9);
+  float amtP = 0.035*smoothstep(0.45, 0.80, n);
+
+  vec3  ink = inkP;
+  float amt = amtP;
   if(uCamMix > 0.001){
     vec3 cam = camS(uvc);
     float lum = dot(cam, vec3(0.299, 0.587, 0.114));
     vec3 tint = pal(uColor + lum*0.85);
-    vec3 ink  = mix(tint, cam, 0.15 + uColor*0.30);   /* conserva parte del color real */
-    col = mix(col, ink, clamp(mv*(0.10 + uPush*0.28), 0.0, 0.55));
-  }else{
-    float n = fbm3(uvc*(1.0 + uDetail*3.0) + uTime*0.10);
-    col = mix(col, pal(uColor + n*0.9), 0.035*smoothstep(0.45, 0.80, n));
+    vec3 inkC = mix(tint, cam, 0.15 + uColor*0.30);   /* conserva parte del color real */
+    float amtC = clamp(mv*(0.10 + uPush*0.28), 0.0, 0.55);
+    ink = mix(inkP, inkC, uCamMix);
+    amt = mix(amtP, amtC, uCamMix);
   }
+  col = mix(col, ink, amt);
 
   /* persistencia: FEED va de ~2 s de memoria a casi permanente */
   col *= 0.990 + uFeed*0.0095;
@@ -506,11 +512,13 @@ vec4 simFlow(vec2 uv, vec2 uvc){
    va en la pasada de salida porque es del monitor, no de la señal.
 ============================================================== */
 vec3 crtSrc(vec2 q){
-  if(uCamMix > 0.001) return camS(q);
-  /* sin cámara: bandas duras, porque el ringing necesita bordes para sonar */
+  if(uCamMix > 0.999) return camS(q);
+  /* bandas duras: el ringing necesita bordes para sonar */
   float n = fbm2(q*2.4 + uTime*0.14);
   n = floor(n*7.0)/7.0;
-  return pal(uColor + n*1.2)*(0.25 + 0.95*n);
+  vec3 proc = pal(uColor + n*1.2)*(0.25 + 0.95*n);
+  if(uCamMix < 0.001) return proc;
+  return mix(proc, camS(q), uCamMix);      /* fundido continuo, no interruptor */
 }
 vec4 simCrt(vec2 uv, vec2 uvc){
   vec2 px = 1.0/uRes;
@@ -548,9 +556,10 @@ vec4 simCrt(vec2 uv, vec2 uvc){
     vec3 hv = rgb2hsv(clamp(col, 0.0, 1.0));
     hv.x = fract(hv.x + uColor);
     hv.y = clamp(hv.y*1.5 + 0.30, 0.0, 1.0);
-    col = hsv2rgb(hv);
-    float l = dot(col, vec3(0.299, 0.587, 0.114));
-    col = mix(col, pal(uColor + l*1.15)*(0.30 + 0.95*l), 0.40);
+    vec3 graded = hsv2rgb(hv);
+    float l = dot(graded, vec3(0.299, 0.587, 0.114));
+    graded = mix(graded, pal(uColor + l*1.15)*(0.30 + 0.95*l), 0.40);
+    col = mix(col, graded, uCamMix);       /* el grading también entra gradual */
   }
 
   /* escalonado de niveles: la señal se cuantiza */
@@ -614,25 +623,24 @@ void main(){
   /* advección semi-lagrangiana: la velocidad se transporta a sí misma */
   vec2 v = texture(uVel, uv - s.rg*px).rg;
 
-  float lum = 0.0, mv = 0.0;
-  vec2 grad = vec2(0.0);
+  /* base procedural: un campo de ruido hace de "movimiento" */
+  float na = fbm2(uvc*2.0 + uTime*0.10);
+  float nb = fbm2(uvc*2.0 + 13.1 - uTime*0.08);
+  vec2  grad = vec2(nb - 0.5, 0.5 - na)*0.6;
+  float mv   = 0.45;
+  float lum  = na;
 
+  /* y la cámara se funde encima según el fader, sin salto */
   if(uCamMix > 0.001){
     vec3 cam = camV(uvc);
-    lum = lumaV(cam);
-    /* diferencia con el frame anterior = movimiento */
-    mv = smoothstep(0.015, 0.20, abs(lum - s.b));
-    /* gradiente de luminancia: el fluido se empuja por los bordes de la imagen */
+    float lumC = lumaV(cam);
+    float mvC = smoothstep(0.015, 0.20, abs(lumC - s.b));
     vec2 eu = vec2(aspect, 1.0)*px*4.0;
-    grad = vec2(lumaV(camV(uvc + vec2(eu.x, 0.0))) - lumaV(camV(uvc - vec2(eu.x, 0.0))),
-                lumaV(camV(uvc + vec2(0.0, eu.y))) - lumaV(camV(uvc - vec2(0.0, eu.y))));
-  }else{
-    /* sin cámara: un campo de ruido hace de "movimiento" para que siga vivo */
-    float na = fbm2(uvc*2.0 + uTime*0.10);
-    float nb = fbm2(uvc*2.0 + 13.1 - uTime*0.08);
-    grad = vec2(nb - 0.5, 0.5 - na)*0.6;
-    mv = 0.45;
-    lum = na;
+    vec2 gradC = vec2(lumaV(camV(uvc + vec2(eu.x, 0.0))) - lumaV(camV(uvc - vec2(eu.x, 0.0))),
+                      lumaV(camV(uvc + vec2(0.0, eu.y))) - lumaV(camV(uvc - vec2(0.0, eu.y))));
+    grad = mix(grad, gradC, uCamMix);
+    mv   = mix(mv,   mvC,   uCamMix);
+    lum  = mix(lum,  lumC,  uCamMix);
   }
 
   /* fuerza principal */
