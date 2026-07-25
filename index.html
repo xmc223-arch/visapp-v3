@@ -168,7 +168,7 @@ let toastT;
 function toast(m){ const t=$('#toast'); t.textContent=m; t.style.opacity='1'; clearTimeout(toastT); toastT=setTimeout(()=>t.style.opacity='0',1500); }
 
 /* -------------------------------------------------- 1 · PARÁMETROS */
-const SCENES = ['FLUX','OIL','MIRROR','CHROME'];
+const SCENES = ['MELT','OIL','MIRROR','CHROME'];
 
 const P = {
   push  : {label:'PUSH',   min:0, max:1, def:0.35, auto:0.35},
@@ -277,68 +277,47 @@ vec3 camS(vec2 q){
   return texture(uCam, clamp(uv, 0.0, 1.0)).rgb;
 }
 
-/* ============ FLUX ============
-   Advección por campo de flujo (curl de fbm) + inyección de pigmento por
-   máscara de ruido. Guarda color en RGB y un campo de altura en A, que la
-   pasada de salida usa para el relieve y los contornos.
-   Todo el mezclado es interpolación, no suma → no puede irse a blanco.
+/* ============ MELT — espejo líquido ============
+   La cámara ES la imagen: se muestrea refractada por un campo de flujo y se
+   arrastra sobre sí misma, así que escurre y se estira sin dejar de ser
+   reconocible. Donde hay movimiento se derrite más.
+   RGB = imagen derretida, A = altura para el brillo mojado.
 ============================================================== */
-vec4 simFlux(vec2 uv, vec2 uvc){
+vec4 simMelt(vec2 uv, vec2 uvc){
   float t  = uTime;
   vec2  px = 1.0/uRes;
-  float sc = 0.8 + uDetail*3.4;
+  float sc = 0.7 + uDetail*3.5;
 
   /* campo de flujo: pseudo-curl de dos fbm desfasados */
-  float n1 = fbm3(uvc*sc + vec2(0.0, t*0.13));
-  float n2 = fbm3(uvc*sc + vec2(t*0.11, 0.0) + 27.3);
-  vec2 curl = vec2(n2 - 0.5, 0.5 - n1)*2.0;
+  float n1 = fbm3(uvc*sc + vec2(0.0, t*0.19));
+  float n2 = fbm3(uvc*sc + vec2(t*0.16, 0.0) + 19.7);
+  vec2 flow = vec2(n2 - 0.5, 0.5 - n1)*2.0;
 
-  vec4 pv = texture(uPrev, uv);
+  /* dirección de escurrimiento: flujo + gravedad + swirl + lift */
+  vec2 disp = flow*(0.5 + uPush*2.4);
+  disp += vec2(0.0, -1.0)*(0.22 + uBass*1.7 + uHit*2.1);
+  if(uSwirl > 0.02) disp += vec2(-uvc.y, uvc.x)/(length(uvc) + 0.30)*uSwirl*3.2;
+  if(uLift  > 0.02) disp += vec2(-1.0, 0.0)*uLift*4.2;
 
-  vec2 adv = curl*(0.35 + uPush*2.2);
-  adv += vec2(sin(uColor*PI + t*0.10), cos(uColor*PI + t*0.08))*0.30;
-  if(uSwirl > 0.02) adv += vec2(-uvc.y, uvc.x)/(length(uvc) + 0.28)*uSwirl*2.4;
-  if(uLift  > 0.02) adv += vec2(-1.0, 0.0)*uLift*3.2;
-  adv += normalize(uvc + 1e-5)*uHit*2.2*uPush;
-  adv += (pv.rg - pv.gb)*(0.8 + uHigh*2.2);          /* el color se auto-advecta */
+  float sp = 1.0 + uPush*3.0 + uBass*2.2 + uHit*3.0;
+  vec2 suv = uv - disp*px*sp*2.4;
+  vec4 pv  = texture(uPrev, suv);
+  vec3 prev = pv.rgb;
 
-  float sp = 1.2 + uPush*3.2 + uBass*2.4 + uHit*3.4;
-  vec2 suv = uv - adv*px*sp*2.2;
+  /* fuente: cámara refractada por el mismo campo; sin cámara, gradiente */
+  vec2 warp = flow*(0.015 + uPush*0.10) + (prev.rg - 0.5)*0.05*(1.0 + uHigh*2.0);
+  vec3 src = pal(uColor + n1*0.9 + n2*0.4)*(0.35 + 0.65*n1);
+  if(uCamMix > 0.001) src = mix(src, camS(uvc + warp), uCamMix);
 
-  vec4 sv  = texture(uPrev, suv);
-  vec3 col = sv.rgb;
+  /* movimiento aparente: donde cambia respecto al frame anterior, escurre más */
+  float mv = clamp(length(src - prev)*1.6, 0.0, 1.0);
+  prev = mix(prev, texture(uPrev, suv - disp*px*mv*sp*3.0).rgb, 0.6);
 
-  /* difusión ligera: quita el ruido de un pixel y suaviza los bordes duros */
-  vec3 blr = ( texture(uPrev, suv + vec2(px.x, 0.0)).rgb
-             + texture(uPrev, suv - vec2(px.x, 0.0)).rgb
-             + texture(uPrev, suv + vec2(0.0, px.y)).rgb
-             + texture(uPrev, suv - vec2(0.0, px.y)).rgb )*0.25;
-  col = mix(col, blr, 0.10);
+  /* la cámara alimenta, el frame anterior derrite */
+  vec3 col = mix(src, prev, clamp(uFeed*0.97, 0.0, 0.97));
+  col = mix(col, prev, mv*0.35);
 
-  /* inyección de pigmento: poca base, refuerzo donde el ruido es alto */
-  float ink  = fbm3(uvc*sc*1.7 - curl*0.6 + t*0.07);
-  float mask = smoothstep(0.34, 0.66, ink);
-  /* rango de tono amplio → hues distintos en vez de un promedio café */
-  vec3  pig  = pal(uColor + ink*1.1 + sv.a*0.5);
-  pig = mix(vec3(dot(pig, vec3(0.333))), pig, 0.85);
-  float amt = 0.006 + 0.055*mask + uBass*0.055 + uHit*0.09;
-  col = mix(col, pig, amt);
-
-  /* decaimiento: el lienzo cae a negro, nunca acumula hacia blanco */
-  col *= 0.986 + uFeed*0.012;
-  col -= 0.0008;
-
-  /* campo de altura para el relieve (la parte de Mais Garde) */
-  float hn = fbm3(uvc*sc*2.4 + curl*(0.4 + uPush*1.6) + t*0.09);
-  hn = mix(hn, dot(col, vec3(0.333))*1.2, 0.40);
-  float h = mix(hn, sv.a, clamp(uFeed*0.86, 0.0, 0.94));
-
-  if(uCamMix > 0.001){
-    vec3 cam = camS(uvc);
-    col = mix(col, cam, uCamMix*0.10);
-    h   = mix(h, dot(cam, vec3(0.333)), uCamMix*0.45);
-  }
-
+  float h = dot(col, vec3(0.333)) + (n1 - 0.5)*0.35 + mv*0.25;
   return vec4(clamp(col, 0.0, 1.0), h);
 }
 
@@ -489,7 +468,7 @@ void main(){
     return;
   }
 
-  if      (uScene == 0) fragColor = simFlux(uv, uvc);
+  if      (uScene == 0) fragColor = simMelt(uv, uvc);
   else if (uScene == 1) fragColor = simRelief(uv, uvc);
   else if (uScene == 2) fragColor = simMirror(uv, uvc);
   else                  fragColor = simChrome(uv, uvc);
@@ -507,44 +486,30 @@ void main(){
   vec3 c;
 
   if(uScene == 0){
-    /* FLUX — pintura advectada + relieve y contornos desde el canal de altura */
+    /* MELT — la imagen derretida con acabado mojado */
     vec2 e = 1.0/uRes;
-    vec4  s     = texture(uTex, uv);
-    vec3  paint = s.rgb;
-    float hC    = s.a;
+    vec4 s = texture(uTex, uv);
+    c = s.rgb;
 
-    float rel = 30.0 + uDetail*70.0;
+    float rel = 14.0 + uDetail*42.0;
     float hx = texture(uTex, uv + vec2(e.x,0.0)).a - texture(uTex, uv - vec2(e.x,0.0)).a;
     float hy = texture(uTex, uv + vec2(0.0,e.y)).a - texture(uTex, uv - vec2(0.0,e.y)).a;
     vec3 n = normalize(vec3(-hx*rel, -hy*rel, 1.0));
 
-    vec3 L = normalize(vec3(cos(uTime*0.25)*0.6, sin(uTime*0.21)*0.6, 0.80));
-    /* iluminación multiplicativa con piso: modela sin blanquear */
-    float diff = 0.54 + 0.58*clamp(dot(n, L), 0.0, 1.0);
-    float spec = pow(clamp(dot(reflect(-L, n), vec3(0.0,0.0,1.0)), 0.0, 1.0), 30.0 + uDetail*40.0);
+    vec3 L = normalize(vec3(cos(uTime*0.30)*0.55, sin(uTime*0.24)*0.55, 0.82));
+    float spec = pow(clamp(dot(reflect(-L, n), vec3(0.0,0.0,1.0)), 0.0, 1.0), 26.0 + uDetail*50.0);
+    float fres = pow(1.0 - clamp(n.z, 0.0, 1.0), 2.0);
 
-    c = paint*diff;
+    c *= 0.80 + 0.35*clamp(dot(n, L), 0.0, 1.0);        /* modelado suave */
+    c += spec*0.45*(0.6 + uHigh*0.8);                   /* brillo mojado */
+    c = mix(c, c*pal(uColor + 0.5)*1.6, fres*0.35);     /* borde teñido: vidrio */
 
-    /* contornos que oscurecen y tiñen, en vez de encender */
-    float bands = 4.0 + uDetail*18.0;
-    float f = fract(hC*bands);
-    float m = min(f, 1.0 - f);
-    float line = 1.0 - smoothstep(0.0, 0.035 + uHigh*0.04, m);
-    c = mix(c, pal(uColor + 0.45)*0.62, line*0.68);
-
-    c += spec*0.50*(0.6 + uHigh*0.5);
-
-    /* techo de saturación */
     vec3 hv = rgb2hsv(clamp(c, 0.0, 4.0));
-    hv.y = min(hv.y*0.95, 0.82);
+    hv.y = min(hv.y*1.05, 0.85);
     c = hsv2rgb(hv);
 
-    /* curva S: recupera contraste sin subir saturación */
-    c = mix(c, c*c*(3.0 - 2.0*clamp(c, 0.0, 1.0)), 0.45);
-
-    /* compresión suave de luces: mantiene el tono, mata el blanco quemado */
     float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
-    float kn = 0.78;
+    float kn = 0.80;
     if(lum > kn) c *= (kn + (lum - kn)/(1.0 + (lum - kn)*2.6))/max(lum, 1e-4);
 
   } else if(uScene == 1){
