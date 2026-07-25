@@ -2,7 +2,7 @@
 <html lang="es">
 <head>
 <meta charset="utf-8">
-<title>VISAPP — v0.3</title>
+<title>VJPXLZD</title>
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
@@ -123,7 +123,7 @@
 <canvas id="gl"></canvas>
 
 <div id="top">
-  <div class="brand"><span id="beatdot"></span><b>VISAPP</b> <span class="fps" id="fps">--</span></div>
+  <div class="brand"><span id="beatdot"></span><b>VJPXLZD</b> <span class="fps" id="fps">--</span></div>
   <button class="btn" id="bCam">CAM OFF</button>
   <button class="btn" id="bMic">MIC</button>
   <button class="btn" id="bHide">UI</button>
@@ -168,7 +168,7 @@ let toastT;
 function toast(m){ const t=$('#toast'); t.textContent=m; t.style.opacity='1'; clearTimeout(toastT); toastT=setTimeout(()=>t.style.opacity='0',1500); }
 
 /* -------------------------------------------------- 1 · PARÁMETROS */
-const SCENES = ['CHURN','RELIEF','MIRROR','CHROME'];
+const SCENES = ['FLUX','OIL','MIRROR','CHROME'];
 
 const P = {
   push  : {label:'PUSH',   min:0, max:1, def:0.35, auto:0.35},
@@ -713,7 +713,6 @@ async function toggleMic(){
 async function flipCam(){
   facing = (facing === 'user') ? 'environment' : 'user';
   if(camMode !== 0) await applyMedia(true, micOn);
-  toast(facing === 'user' ? 'Frontal' : 'Trasera');
 }
 function updateCam(){
   if(!video || video.readyState < 2) return;
