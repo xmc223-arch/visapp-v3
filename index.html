@@ -169,7 +169,7 @@ let toastT;
 function toast(m){ const t=$('#toast'); t.textContent=m; t.style.opacity='1'; clearTimeout(toastT); toastT=setTimeout(()=>t.style.opacity='0',1500); }
 
 /* -------------------------------------------------- 1 · PARÁMETROS */
-const SCENES = ['MELT','OIL','MIRROR','CHROME'];
+const SCENES = ['MELT','OIL','MIRROR','CHROME','FLOW'];
 
 /* rnd = ventana que usa el botón RND. Más angosta que el rango total para que
    no caiga en extremos que apagan el visual (FEED en 0, DETAIL en 0, etc.) */
@@ -273,6 +273,7 @@ in vec2 vUv;
 out vec4 fragColor;
 uniform sampler2D uPrev;
 uniform sampler2D uCam;
+uniform sampler2D uVel;
 
 vec3 camS(vec2 q){
   vec2 uv = vec2(q.x / max(uCamAspect, 0.001), q.y)*0.5 + 0.5;
@@ -461,6 +462,44 @@ vec4 simChrome(vec2 uv, vec2 uvc){
   return vec4(col, 1.0);
 }
 
+/* ============ FLOW — fluido de retroalimentación ============
+   El color se transporta por el campo de velocidad. La cámara nunca se ve
+   directa: sólo inyecta pigmento donde hay movimiento.
+============================================================== */
+vec4 simFlow(vec2 uv, vec2 uvc){
+  vec2 px = 1.0/uRes;
+  vec4 vs = texture(uVel, uv);
+  vec2 v  = vs.rg;
+  float mv = vs.a;
+
+  /* advección del color */
+  vec2 suv = uv - v*px;
+  vec3 col = texture(uPrev, suv).rgb;
+
+  /* difusión: DETAIL bajo = más viscoso y suave */
+  vec3 bl = ( texture(uPrev, suv + vec2(px.x, 0.0)).rgb + texture(uPrev, suv - vec2(px.x, 0.0)).rgb
+            + texture(uPrev, suv + vec2(0.0, px.y)).rgb + texture(uPrev, suv - vec2(0.0, px.y)).rgb )*0.25;
+  col = mix(col, bl, 0.10 + (1.0 - uDetail)*0.26);
+
+  /* inyección de pigmento */
+  if(uCamMix > 0.001){
+    vec3 cam = camS(uvc);
+    float lum = dot(cam, vec3(0.299, 0.587, 0.114));
+    vec3 tint = pal(uColor + lum*0.85);
+    vec3 ink  = mix(tint, cam, 0.15 + uColor*0.30);   /* conserva parte del color real */
+    col = mix(col, ink, clamp(mv*(0.10 + uPush*0.28), 0.0, 0.55));
+  }else{
+    float n = fbm3(uvc*(1.0 + uDetail*3.0) + uTime*0.10);
+    col = mix(col, pal(uColor + n*0.9), 0.035*smoothstep(0.45, 0.80, n));
+  }
+
+  /* persistencia: FEED va de ~2 s de memoria a casi permanente */
+  col *= 0.990 + uFeed*0.0095;
+  col -= 0.0003;
+
+  return vec4(clamp(col, 0.0, 1.0), mv);
+}
+
 void main(){
   vec2 uv = vUv;
   vec2 uvc = uv*2.0 - 1.0;
@@ -471,10 +510,85 @@ void main(){
     return;
   }
 
-  if      (uScene == 0) fragColor = simMelt(uv, uvc);
+  if      (uScene == 4) fragColor = simFlow(uv, uvc);
+  else if (uScene == 0) fragColor = simMelt(uv, uvc);
   else if (uScene == 1) fragColor = simRelief(uv, uvc);
   else if (uScene == 2) fragColor = simMirror(uv, uvc);
   else                  fragColor = simChrome(uv, uvc);
+}`;
+
+/* ---------------- pasada de física (solo FLOW) ----------------
+   rg = velocidad (px/frame), b = luminancia del frame anterior,
+   a = magnitud de movimiento suavizada.
+--------------------------------------------------------------- */
+const FS_VEL = `#version 300 es
+${COMMON}
+in vec2 vUv;
+out vec4 fragColor;
+uniform sampler2D uVel;
+uniform sampler2D uCam;
+
+vec3 camV(vec2 q){
+  vec2 uv = vec2(q.x / max(uCamAspect, 0.001), q.y)*0.5 + 0.5;
+  uv.x = mix(uv.x, 1.0 - uv.x, uMirrorX);
+  return texture(uCam, clamp(uv, 0.0, 1.0)).rgb;
+}
+float lumaV(vec3 c){ return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+void main(){
+  vec2 uv  = vUv;
+  vec2 uvc = uv*2.0 - 1.0;
+  float aspect = uRes.x/uRes.y;
+  uvc.x *= aspect;
+  vec2 px = 1.0/uRes;
+
+  if(uFrame < 3.0){ fragColor = vec4(0.0); return; }
+
+  vec4 s = texture(uVel, uv);
+
+  /* advección semi-lagrangiana: la velocidad se transporta a sí misma */
+  vec2 v = texture(uVel, uv - s.rg*px).rg;
+
+  float lum = 0.0, mv = 0.0;
+  vec2 grad = vec2(0.0);
+
+  if(uCamMix > 0.001){
+    vec3 cam = camV(uvc);
+    lum = lumaV(cam);
+    /* diferencia con el frame anterior = movimiento */
+    mv = smoothstep(0.015, 0.20, abs(lum - s.b));
+    /* gradiente de luminancia: el fluido se empuja por los bordes de la imagen */
+    vec2 eu = vec2(aspect, 1.0)*px*4.0;
+    grad = vec2(lumaV(camV(uvc + vec2(eu.x, 0.0))) - lumaV(camV(uvc - vec2(eu.x, 0.0))),
+                lumaV(camV(uvc + vec2(0.0, eu.y))) - lumaV(camV(uvc - vec2(0.0, eu.y))));
+  }else{
+    /* sin cámara: un campo de ruido hace de "movimiento" para que siga vivo */
+    float na = fbm2(uvc*2.0 + uTime*0.10);
+    float nb = fbm2(uvc*2.0 + 13.1 - uTime*0.08);
+    grad = vec2(nb - 0.5, 0.5 - na)*0.6;
+    mv = 0.45;
+    lum = na;
+  }
+
+  /* fuerza principal */
+  v += grad*mv*(0.6 + uPush*6.0)*(1.0 + uBass*0.8);
+
+  /* turbulencia por curl de ruido, escalada por el movimiento */
+  float sc = 1.5 + uDetail*4.0;
+  float n1 = fbm2(uvc*sc + uTime*0.15);
+  float n2 = fbm2(uvc*sc + 31.7 - uTime*0.12);
+  v += vec2(n2 - 0.5, 0.5 - n1)*2.0*uSwirl*(0.4 + mv*3.0)*(0.6 + uHigh*1.0);
+
+  /* viscosidad: la velocidad se difunde hacia los vecinos */
+  vec2 lap = ( texture(uVel, uv + vec2(px.x, 0.0)).rg + texture(uVel, uv - vec2(px.x, 0.0)).rg
+             + texture(uVel, uv + vec2(0.0, px.y)).rg + texture(uVel, uv - vec2(0.0, px.y)).rg )*0.25;
+  v = mix(v, lap, 0.12 + (1.0 - uDetail)*0.34);
+
+  /* disipación */
+  v *= 0.962 + uFeed*0.034;
+  v = clamp(v, -55.0, 55.0);
+
+  fragColor = vec4(v, lum, max(mv, s.a*0.92));
 }`;
 
 /* ---------------- pasada de salida ---------------- */
@@ -483,12 +597,38 @@ ${COMMON}
 in vec2 vUv;
 out vec4 fragColor;
 uniform sampler2D uTex;
+uniform sampler2D uVel;
 
 void main(){
   vec2 uv = vUv;
   vec3 c;
 
-  if(uScene == 0){
+  if(uScene == 4){
+    /* FLOW — acumulación, desenfoque direccional, refracción y brillo por velocidad */
+    vec2 px = 1.0/uRes;
+    vec2 v  = texture(uVel, uv).rg;
+    float sp = length(v);
+
+    vec3 acc = vec3(0.0);
+    for(int i = 0; i < 4; i++) acc += texture(uTex, uv - v*px*float(i)*0.45).rgb;
+    c = acc*0.25;
+
+    /* refracción: los canales se separan a lo largo del flujo */
+    c.r = texture(uTex, uv - v*px*0.9).r;
+    c.b = texture(uTex, uv + v*px*0.9).b;
+
+    /* la saturación sube donde hay movimiento */
+    vec3 hv = rgb2hsv(clamp(c, 0.0, 1.0));
+    hv.y = clamp(hv.y*(0.85 + smoothstep(0.0, 8.0, sp)*0.90), 0.0, 0.90);
+    c = hsv2rgb(hv);
+
+    /* el brillo aparece sólo en zonas rápidas */
+    c += pal(uColor + 0.35)*smoothstep(6.0, 22.0, sp)*(0.30 + uHigh*0.45);
+
+    float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    if(lum > 0.82) c *= (0.82 + (lum - 0.82)/(1.0 + (lum - 0.82)*2.6))/max(lum, 1e-4);
+
+  } else if(uScene == 0){
     /* MELT — la imagen derretida con acabado mojado */
     vec2 e = 1.0/uRes;
     vec4 s = texture(uTex, uv);
@@ -587,12 +727,14 @@ function program(fsSrc){
 
 const progSim = gl ? program(FS_SIM) : null;
 const progOut = gl ? program(FS_OUT) : null;
+const progVel = gl ? program(FS_VEL) : null;
 
 const locCache = new Map();
 function u(prog, name){
-  const key = name + (prog === progOut ? '#o' : '#s');
-  if(!locCache.has(key)) locCache.set(key, gl.getUniformLocation(prog, name));
-  return locCache.get(key);
+  let m = locCache.get(prog);
+  if(!m){ m = new Map(); locCache.set(prog, m); }
+  if(!m.has(name)) m.set(name, gl.getUniformLocation(prog, name));
+  return m.get(name);
 }
 const set1f = (p,n,v)   => { const l=u(p,n); if(l) gl.uniform1f(l,v); };
 const set1i = (p,n,v)   => { const l=u(p,n); if(l) gl.uniform1i(l,v); };
@@ -601,7 +743,7 @@ const set2f = (p,n,a,b) => { const l=u(p,n); if(l) gl.uniform2f(l,a,b); };
 const vao = gl ? gl.createVertexArray() : null;
 
 /* -------------------------------------------------- 3 · BUFFERS */
-let fbo = [], W = 1, H = 1, HALF = false;
+let fbo = [], vfbo = [], W = 1, H = 1, HALF = false;
 if(gl){
   const eF  = gl.getExtension('EXT_color_buffer_float');
   const eHF = gl.getExtension('EXT_color_buffer_half_float');
@@ -634,7 +776,9 @@ function resize(force){
   cvs.width = W; cvs.height = H;
   cvs.style.width = '100%'; cvs.style.height = '100%';
   fbo.forEach(o => { gl.deleteTexture(o.t); gl.deleteFramebuffer(o.f); });
-  fbo = [makeTarget(W, H), makeTarget(W, H)];
+  vfbo.forEach(o => { gl.deleteTexture(o.t); gl.deleteFramebuffer(o.f); });
+  fbo  = [makeTarget(W, H), makeTarget(W, H)];
+  vfbo = [makeTarget(W, H), makeTarget(W, H)];   /* campo de velocidad para FLOW */
   frameCount = 0;
 }
 if(gl) resize(true);
@@ -1045,26 +1189,43 @@ function frame(ms){
   }
 
   const read = ping, write = 1 - ping;
+  const vread = ping, vwrite = 1 - ping;
 
+  gl.bindVertexArray(vao);
+
+  /* pasada 0 — física del fluido (sólo FLOW) */
+  if(sceneIdx === 4 && progVel){
+    gl.bindFramebuffer(gl.FRAMEBUFFER, vfbo[vwrite].f);
+    gl.viewport(0, 0, W, H);
+    gl.useProgram(progVel);
+    common(progVel);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, vfbo[vread].t); set1i(progVel,'uVel',0);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, camTex);        set1i(progVel,'uCam',1);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+
+  /* pasada 1 — color */
   gl.bindFramebuffer(gl.FRAMEBUFFER, fbo[write].f);
   gl.viewport(0, 0, W, H);
   gl.useProgram(progSim);
-  gl.bindVertexArray(vao);
   common(progSim);
-  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, fbo[read].t); set1i(progSim,'uPrev',0);
-  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, camTex);      set1i(progSim,'uCam',1);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, fbo[read].t);    set1i(progSim,'uPrev',0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, camTex);         set1i(progSim,'uCam',1);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, vfbo[vwrite].t); set1i(progSim,'uVel',2);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 
+  /* pasada 2 — salida */
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   gl.viewport(0, 0, W, H);
   gl.useProgram(progOut);
   common(progOut);
-  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, fbo[write].t); set1i(progOut,'uTex',0);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, fbo[write].t);   set1i(progOut,'uTex',0);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, vfbo[vwrite].t); set1i(progOut,'uVel',2);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 
   ping = write;
 }
-if(gl && progSim && progOut) requestAnimationFrame(frame);
+if(gl && progSim && progOut && progVel) requestAnimationFrame(frame);
 
 if(!window.isSecureContext) toast('Ábrelo por HTTPS para cámara y mic');
 </script>
