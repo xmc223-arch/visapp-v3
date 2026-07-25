@@ -514,6 +514,16 @@ vec3 crtSrc(vec2 q){
 }
 vec4 simCrt(vec2 uv, vec2 uvc){
   vec2 px = 1.0/uRes;
+  float t = uTime;
+
+  /* onda viajera: de aquí sale la sensación de fluido.
+     El ringing se muestrea sobre estas coordenadas, así que los ecos
+     siguen líneas curvas en vez de rectas. */
+  float wa = 0.008 + uSwirl*0.11;
+  float wf = 5.0 + uDetail*20.0;
+  vec2 w = uvc;
+  w.x += sin(uvc.y*wf + t*1.7)*wa + sin(uvc.y*wf*0.36 - t*0.95)*wa*1.5;
+  w.y += cos(uvc.x*wf*0.45 + t*1.2)*wa*0.6;
 
   /* ringing: 6 ecos con pesos que alternan de signo y decaen */
   float amp = 0.004 + uPush*0.055 + uHit*0.02;
@@ -521,24 +531,35 @@ vec4 simCrt(vec2 uv, vec2 uvc){
   float wsum = 0.0;
   for(int i = 0; i < 6; i++){
     float fi = float(i);
-    float w = cos(fi*2.1 + uSwirl*3.0)/(1.0 + fi*0.8);
-    acc  += crtSrc(uvc - vec2(amp*fi, 0.0))*w;
-    wsum += abs(w);
+    float k = cos(fi*2.1 + t*0.7)/(1.0 + fi*0.8);
+    acc  += crtSrc(w - vec2(amp*fi, 0.0))*k;
+    wsum += abs(k);
   }
   vec3 ring = acc/max(wsum, 1e-4);
 
   /* separación de croma: cada canal llega con distinto retardo */
   float ca = amp*(1.3 + uHigh*2.2);
-  vec3 col = vec3(crtSrc(uvc - vec2(ca, 0.0)).r, ring.g, crtSrc(uvc + vec2(ca, 0.0)).b);
-  col = mix(ring, col, 0.75)*1.25;
+  vec3 col = vec3(crtSrc(w - vec2(ca, 0.0)).r, ring.g, crtSrc(w + vec2(ca, 0.0)).b);
+  col = mix(ring, col, 0.78)*1.25;
+
+  /* COLOR con cámara: rota el tono y sube saturación. Antes este knob
+     no hacía nada porque la cámara se devolvía sin tocar. */
+  if(uCamMix > 0.001){
+    vec3 hv = rgb2hsv(clamp(col, 0.0, 1.0));
+    hv.x = fract(hv.x + uColor);
+    hv.y = clamp(hv.y*1.5 + 0.30, 0.0, 1.0);
+    col = hsv2rgb(hv);
+    float l = dot(col, vec3(0.299, 0.587, 0.114));
+    col = mix(col, pal(uColor + l*1.15)*(0.30 + 0.95*l), 0.40);
+  }
 
   /* escalonado de niveles: la señal se cuantiza */
   float lv = 3.0 + floor(uDetail*13.0);
   col = floor(clamp(col, 0.0, 1.4)*lv + 0.5)/lv;
 
-  /* persistencia del fósforo, con un poco de arrastre vertical */
-  vec3 prev = texture(uPrev, uv + vec2(0.0, px.y*0.6)).rgb;
-  col = max(col, prev*(uFeed*0.90));
+  /* la estela sigue la onda: por eso escurre en vez de quedarse quieta */
+  vec2 fd = vec2(sin(uv.y*wf*2.0 + t*1.7)*(0.5 + uSwirl*2.5), 0.6)*px;
+  col = max(col, texture(uPrev, uv + fd).rgb*(uFeed*0.92));
 
   return vec4(clamp(col, 0.0, 1.0), 1.0);
 }
