@@ -169,7 +169,7 @@ let toastT;
 function toast(m){ const t=$('#toast'); t.textContent=m; t.style.opacity='1'; clearTimeout(toastT); toastT=setTimeout(()=>t.style.opacity='0',1500); }
 
 /* -------------------------------------------------- 1 · PARÁMETROS */
-const SCENES = ['MELT','OIL','MIRROR','CHROME','FLOW','CRT'];
+const SCENES = ['MELT','OIL','MIRROR','CHROME','FLOW','CRT','GLITCH'];
 
 /* rnd = ventana que usa el botón RND. Más angosta que el rango total para que
    no caiga en extremos que apagan el visual (FEED en 0, DETAIL en 0, etc.) */
@@ -181,6 +181,7 @@ const P = {
   feed  : {label:'FEED',   min:0, max:1, def:0.50, auto:0.25, rnd:[0.25, 0.90]},
 };
 const F = {
+  main   : {label:'MAIN', min:0, max:1, def:1.00},   /* intensidad del efecto */
   camMix : {label:'CAM',  min:0, max:1, def:0.60},
   bassAmt: {label:'BASS', min:0, max:1, def:0.85},
   highAmt: {label:'HIGH', min:0, max:1, def:0.70},
@@ -228,7 +229,7 @@ uniform float uPush, uSwirl, uDetail, uColor, uFeed;
 uniform float uBass, uMid, uHigh, uLevel, uHit, uBeat, uTog, uRnd;
 uniform float uLift, uMotion, uBright;
 uniform float uCamMix, uCamAspect, uMirrorX;
-uniform float uFrame, uSteps;
+uniform float uFrame, uSteps, uMain;
 
 mat2 rot(float a){ float c=cos(a), s=sin(a); return mat2(c,-s,s,c); }
 vec4 sig4(vec4 x){ return x/(1.0+abs(x)); }
@@ -573,6 +574,73 @@ vec4 simCrt(vec2 uv, vec2 uvc){
   return vec4(clamp(col, 0.0, 1.0), 1.0);
 }
 
+/* ============ GLITCH — feedback deformado sobre la cámara ============
+   PUSH  = daño de señal (zigzag por líneas + separación RGB)
+   SWIRL = ecos laterales (deriva y onda del feedback)
+   DETAIL= grosor analógico (tamaño de bloque + niveles)
+   COLOR = tinte
+   FEED  = legibilidad (cuánto se acumula)
+   El lazo guarda señal cruda: el grading va en la pasada de salida.
+============================================================== */
+vec3 gSrc(vec2 p){
+  if(uCamMix > 0.999) return camS(p);
+  float n = fbm2(p*2.2 + uTime*0.12);
+  n = floor(n*7.0)/7.0;
+  vec3 proc = pal(uColor + n*1.15)*(0.22 + 0.95*n);
+  if(uCamMix < 0.001) return proc;
+  return mix(proc, camS(p), uCamMix);
+}
+float gHash(float n){ return fract(sin(n)*43758.5453123); }
+float gMirror(float x){ x = mod(x, 2.0); return 1.0 - abs(x - 1.0); }
+
+vec4 simGlitch(vec2 uv, vec2 uvc){
+  float t = uTime;
+  float aspect = uRes.x/uRes.y;
+
+  /* bloques: emula resolución interna baja sin buffers extra */
+  float grid = 480.0 - uDetail*300.0;
+  vec2 quv = (floor(uv*grid) + 0.5)/grid;
+
+  /* desplazamiento por líneas: tres componentes, una inestable */
+  float dmg  = 0.25 + uPush*1.9 + uHit*0.5;
+  float line = floor(quv.y*240.0);
+  float shift = ( sin(quv.y*18.0  + t*0.7)*0.018
+                + sin(quv.y*115.0 + t*2.4)*0.009
+                + (gHash(line + floor(t*12.0)) - 0.5)*0.012*(0.4 + uMid) )*dmg;
+
+  vec2 wuv = quv;
+  wuv.x = gMirror(wuv.x + shift);
+  vec2 p = vec2((wuv.x*2.0 - 1.0)*aspect, wuv.y*2.0 - 1.0);
+
+  /* separación RGB siguiendo la línea, no radial */
+  float sp = (0.006 + uPush*0.028 + uHigh*0.020)*2.0*aspect;
+  vec3 cur = vec3(gSrc(p + vec2(sp, 0.0)).r,
+                  gSrc(p).g,
+                  gSrc(p - vec2(sp*1.4, 0.0)).b);
+
+  /* contraste y posterización */
+  cur = (cur - 0.5)*1.8 + 0.5;
+  float lv = 4.0 + floor((1.0 - uDetail)*10.0);
+  cur = floor(clamp(cur, 0.0, 1.0)*lv)/lv;
+
+  /* bordes y ringing sobre la señal, nunca sobre el buffer */
+  vec2 ex = vec2(2.0/grid*aspect, 0.0), ey = vec2(0.0, 2.0/grid);
+  float edge = length(gSrc(p + ex) - gSrc(p - ex)) + length(gSrc(p + ey) - gSrc(p - ey));
+  cur -= smoothstep(0.12, 0.45, edge)*0.65;
+  cur += gSrc(p + ex*1.5)*0.12;
+  cur -= gSrc(p - ex*2.0)*0.10;
+
+  /* frame anterior deformado: de aquí salen los peines laterales */
+  float ech = 0.15 + uSwirl*1.6;
+  vec2 ouv = uv;
+  ouv.x += 0.003*ech + sin(uv.y*80.0 + t*2.0)*0.005*ech;
+  ouv.y += 0.0012;
+  ouv.x = gMirror(ouv.x);
+  vec3 prev = texture(uPrev, ouv).rgb;
+
+  return vec4(clamp(mix(clamp(cur, 0.0, 1.0), prev, uFeed*0.93), 0.0, 1.0), 1.0);
+}
+
 void main(){
   vec2 uv = vUv;
   vec2 uvc = uv*2.0 - 1.0;
@@ -583,7 +651,8 @@ void main(){
     return;
   }
 
-  if      (uScene == 5) fragColor = simCrt(uv, uvc);
+  if      (uScene == 6) fragColor = simGlitch(uv, uvc);
+  else if (uScene == 5) fragColor = simCrt(uv, uvc);
   else if (uScene == 4) fragColor = simFlow(uv, uvc);
   else if (uScene == 0) fragColor = simMelt(uv, uvc);
   else if (uScene == 1) fragColor = simRelief(uv, uvc);
@@ -671,12 +740,40 @@ in vec2 vUv;
 out vec4 fragColor;
 uniform sampler2D uTex;
 uniform sampler2D uVel;
+uniform sampler2D uCam;
+
+vec3 camOut(vec2 q){
+  vec2 uv = vec2(q.x / max(uCamAspect, 0.001), q.y)*0.5 + 0.5;
+  uv.x = mix(uv.x, 1.0 - uv.x, uMirrorX);
+  return texture(uCam, clamp(uv, 0.0, 1.0)).rgb;
+}
 
 void main(){
   vec2 uv = vUv;
   vec3 c;
 
-  if(uScene == 5){
+  if(uScene == 6){
+    /* GLITCH — grading analógico + pantalla, una sola vez */
+    c = texture(uTex, uv).rgb;
+
+    mat3 analog = mat3( 1.35, -0.10, 0.18,
+                       -0.08,  1.25, 0.20,
+                        0.05,  0.28, 1.45);
+    c = clamp(analog*c, 0.0, 1.0);
+    float lum = dot(c, vec3(0.299, 0.587, 0.114));
+    c = mix(c, pal(uColor + 0.45), smoothstep(0.45, 0.85, lum)*0.45);
+
+    vec2 sp2 = uv*uRes;
+    float scan = 0.86 + 0.14*sin(sp2.y*PI);
+    float cell = mod(floor(sp2.x*0.5), 3.0);
+    vec3 mask = cell < 1.0 ? vec3(1.00, 0.55, 0.55)
+              : cell < 2.0 ? vec3(0.55, 1.00, 0.55)
+                           : vec3(0.55, 0.55, 1.00);
+    c *= scan*(0.92 + 0.08*sin(sp2.y*0.5*PI));
+    c *= mix(vec3(1.0), mask, 0.28);
+    c *= 1.18;
+
+  } else if(uScene == 5){
     /* CRT — retícula de fósforos, líneas de barrido y moiré */
     c = texture(uTex, uv).rgb;
 
@@ -803,7 +900,18 @@ void main(){
   c.b = mix(c.b, texture(uTex, uv - d).b, 0.35);
   float vig = 1.0 - 0.32*pow(length(uv - 0.5)*1.35, 2.0);
   float kick = (uScene == 0) ? 1.0 + uHit*0.04 : 1.0 + uHit*0.09;
-  fragColor = vec4(clamp(c*vig*kick, 0.0, 1.0), 1.0);
+  c = c*vig*kick;
+
+  /* MAIN: intensidad del efecto. En 0 queda la fuente cruda (cámara limpia si
+     está encendida, negro si no); en 1, el efecto completo. */
+  if(uMain < 0.999){
+    vec2 uvc = uv*2.0 - 1.0;
+    uvc.x *= uRes.x/uRes.y;
+    vec3 raw = (uCamMix > 0.001) ? mix(vec3(0.015), camOut(uvc), uCamMix) : vec3(0.015);
+    c = mix(raw, c, uMain);
+  }
+
+  fragColor = vec4(clamp(c, 0.0, 1.0), 1.0);
 }`;
 
 function compile(type, src){
@@ -1282,6 +1390,7 @@ function frame(ms){
     set1f(p,'uMirrorX', facing === 'user' ? 1 : 0);
     set1f(p,'uFrame', frameCount);
     set1f(p,'uSteps', steps);
+    set1f(p,'uMain', val.main);
   }
 
   const read = ping, write = 1 - ping;
@@ -1316,6 +1425,7 @@ function frame(ms){
   gl.useProgram(progOut);
   common(progOut);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, fbo[write].t);   set1i(progOut,'uTex',0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, camTex);         set1i(progOut,'uCam',1);
   gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, vfbo[vwrite].t); set1i(progOut,'uVel',2);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 
